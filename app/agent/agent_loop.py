@@ -32,7 +32,15 @@ from agent.tool_log import (
     payload_for_log,
     split_assistant_preamble,
 )
-from browser.cart_plus import cart_is_filled, read_cart_state
+from browser.cart_plus import (
+    cart_is_filled,
+    cart_item_quantity,
+    click_targets_cart_nav,
+    click_targets_quantity_adjust,
+    click_targets_quantity_decrease,
+    click_targets_quantity_increase,
+    read_cart_state,
+)
 from browser.extractor import extract_page_context
 from browser.overlays import click_blocked_reason
 from browser.url_validate import (
@@ -125,9 +133,6 @@ def _tool_fingerprint(action: dict) -> str:
     return action_fingerprint(action)
 
 
-_MAX_ADD_TO_CART_PER_RUN = 3
-
-
 def _guess_product_name_from_task(user_task: str) -> str:
 
     t = user_task.lower()
@@ -169,6 +174,39 @@ def _task_expects_cart_items(user_task: str) -> bool:
     )
 
     return any(m in t for m in markers)
+
+
+def _task_expects_single_cart_item(user_task: str) -> bool:
+
+    t = user_task.lower()
+
+    if re.search(r"\b(?:два|две|три|четыре|2|3|4|несколько|пару)\b", t):
+
+        return False
+
+    if " и " in t and any(x in t for x in ("добав", "полож", "купи", "закаж")):
+
+        return False
+
+    return True
+
+
+def _max_add_to_cart_for_task(user_task: str) -> int:
+
+    return 1 if _task_expects_single_cart_item(user_task) else 2
+
+
+def _cart_goal_satisfied(cart: dict, *, single_item: bool) -> bool:
+
+    if not cart_is_filled(cart):
+
+        return False
+
+    if single_item and cart_item_quantity(cart) > 1:
+
+        return False
+
+    return True
 
 
 class AgentLoop:
@@ -215,7 +253,17 @@ class AgentLoop:
 
         scroll_streak = 0
 
+        stepper_decrease_clicks = 0
+
+        qty_adjust_history: list[str] = []
+
+        search_enter_sent = False
+
         expects_cart = _task_expects_cart_items(user_task)
+
+        single_cart_item = _task_expects_single_cart_item(user_task)
+
+        max_add_to_cart = _max_add_to_cart_for_task(user_task)
 
         for step in range(1, MAX_AGENT_STEPS + 1):
 
@@ -285,6 +333,24 @@ SESSION_NOTES (накоплено из query_dom на этой задаче):
 
                 runtime_block += nav_hint + "\n"
 
+            if expects_cart:
+
+                cart_rt = read_cart_state(self.browser.page)
+
+                if _cart_goal_satisfied(cart_rt, single_item=single_cart_item):
+
+                    runtime_block += (
+                        "TASK_RUNTIME: CART_GOAL: satisfied — только done, "
+                        "без add_to_cart и без «Увеличить».\n"
+                    )
+
+                elif cart_is_filled(cart_rt):
+
+                    runtime_block += (
+                        f"TASK_RUNTIME: CART qty={cart_item_quantity(cart_rt)} "
+                        "(не увеличивай количество без явного запроса).\n"
+                    )
+
             if page_has_apply_modal(self.browser.page):
 
                 if self._draft_cover_letter:
@@ -346,12 +412,27 @@ CURRENT PAGE:
 
             if act == "done":
 
-                if expects_cart and not cart_is_filled(read_cart_state(self.browser.page)):
+                cart_now = read_cart_state(self.browser.page)
 
-                    last_error = (
-                        "CART_SENSOR: appears_empty — в корзине нет товара. "
-                        'Используй add_to_cart с product_name из результатов поиска, не только scroll.'
-                    )
+                if expects_cart and not _cart_goal_satisfied(
+                    cart_now, single_item=single_cart_item
+                ):
+
+                    q = cart_item_quantity(cart_now)
+
+                    if cart_is_filled(cart_now) and single_cart_item and q > 1:
+
+                        last_error = (
+                            f"CART_SENSOR: qty={q} — лишнее количество. "
+                            "Не жми «Увеличить»; заверши задачу done."
+                        )
+
+                    else:
+
+                        last_error = (
+                            "CART_SENSOR: appears_empty — в корзине нет товара. "
+                            'Один раз add_to_cart с product_name, затем done.'
+                        )
 
                     self._pending_vision_pngs = vision_batch + self._pending_vision_pngs
 
@@ -469,9 +550,21 @@ CURRENT PAGE:
 
             if last_tool_fingerprint is not None and fp == last_tool_fingerprint:
 
-                if act == "add_to_cart":
+                cart = read_cart_state(self.browser.page)
 
-                    cart = read_cart_state(self.browser.page)
+                if expects_cart and _cart_goal_satisfied(
+                    cart, single_item=single_cart_item
+                ):
+
+                    msg = action.get("message") or "Товар в корзине, оплата не требуется."
+
+                    log_using_tool("done", {"message": msg})
+
+                    log_task_finished(msg)
+
+                    return
+
+                if act == "add_to_cart":
 
                     if cart_is_filled(cart):
 
@@ -496,28 +589,52 @@ CURRENT PAGE:
                         "CURRENT PAGE или другой инструмент (add_to_cart, dismiss_overlays, take_screenshot, wait, query_dom)."
                     )
 
+                    if expects_cart and cart_is_filled(cart):
+
+                        last_error = (
+                            "CART_SENSOR: items_present. "
+                            'Следующий шаг только {"action":"done","message":"..."}.'
+                        )
+
                 self._pending_vision_pngs = vision_batch + self._pending_vision_pngs
 
                 continue
 
             if act == "add_to_cart":
 
-                if cart_is_filled(read_cart_state(self.browser.page)):
+                cart_pre = read_cart_state(self.browser.page)
+
+                if _cart_goal_satisfied(cart_pre, single_item=single_cart_item):
 
                     last_error = (
-                        "CART_SENSOR: items_present. Если USER TASK выполнен — done; "
-                        "иначе продолжай без повторного add_to_cart."
+                        "CART_SENSOR: цель корзины достигнута. "
+                        '{"action":"done","message":"..."} — без повторного add_to_cart.'
                     )
 
                     self._pending_vision_pngs = vision_batch + self._pending_vision_pngs
 
                     continue
 
-                if add_to_cart_calls >= _MAX_ADD_TO_CART_PER_RUN:
+                if (
+                    cart_is_filled(cart_pre)
+                    and single_cart_item
+                    and cart_item_quantity(cart_pre) > 1
+                ):
 
                     last_error = (
-                        f"Лимит add_to_cart ({_MAX_ADD_TO_CART_PER_RUN}). "
-                        "Сверь CART_SENSOR; при успехе — done."
+                        f"CART_SENSOR: qty={cart_item_quantity(cart_pre)}. "
+                        "Не добавляй ещё — заверши done."
+                    )
+
+                    self._pending_vision_pngs = vision_batch + self._pending_vision_pngs
+
+                    continue
+
+                if add_to_cart_calls >= max_add_to_cart:
+
+                    last_error = (
+                        f"Лимит add_to_cart ({max_add_to_cart}) за задачу. "
+                        "CART_SENSOR items_present — сделай done, не добавляй ещё."
                     )
 
                     self._pending_vision_pngs = vision_batch + self._pending_vision_pngs
@@ -593,6 +710,125 @@ CURRENT PAGE:
 
                     continue
 
+                cart_now = read_cart_state(self.browser.page)
+
+                cart_qty = cart_item_quantity(cart_now)
+
+                if expects_cart and single_cart_item and click_targets_quantity_adjust(
+                    self.browser.page, sel
+                ):
+
+                    kind = (
+                        "inc"
+                        if click_targets_quantity_increase(self.browser.page, sel)
+                        else "dec"
+                    )
+
+                    qty_adjust_history.append(kind)
+
+                    if len(qty_adjust_history) >= 4:
+
+                        tail = qty_adjust_history[-4:]
+
+                        if tail[0] == tail[2] and tail[1] == tail[3] and tail[0] != tail[1]:
+
+                            if cart_qty >= 1:
+
+                                msg = (
+                                    "В корзине уже есть товар (зацикливание +/- остановлено)."
+                                )
+
+                                log_using_tool("done", {"message": msg})
+
+                                log_task_finished(msg)
+
+                                return
+
+                    if click_targets_quantity_increase(self.browser.page, sel) and cart_qty >= 1:
+
+                        if cart_qty == 1:
+
+                            msg = "Один хот-дог в корзине (qty=1)."
+
+                            log_using_tool("done", {"message": msg})
+
+                            log_task_finished(msg)
+
+                            return
+
+                        last_error = (
+                            f"CART_SENSOR: qty={cart_qty}. "
+                            "Не жми «Увеличить». Один раз «Уменьшить» или done."
+                        )
+
+                        self._pending_vision_pngs = vision_batch + self._pending_vision_pngs
+
+                        continue
+
+                    if click_targets_quantity_decrease(self.browser.page, sel):
+
+                        if cart_qty <= 1:
+
+                            last_error = (
+                                "CART_SENSOR: qty=1 — не трогай счётчик. "
+                                '{"action":"done","message":"..."}'
+                            )
+
+                            self._pending_vision_pngs = vision_batch + self._pending_vision_pngs
+
+                            continue
+
+                        if stepper_decrease_clicks >= 2:
+
+                            last_error = (
+                                f"CART_SENSOR: qty={cart_qty}. "
+                                'Достаточно — {"action":"done","message":"..."}.'
+                            )
+
+                            self._pending_vision_pngs = vision_batch + self._pending_vision_pngs
+
+                            continue
+
+                if (
+                    expects_cart
+                    and _cart_goal_satisfied(cart_now, single_item=single_cart_item)
+                    and click_targets_quantity_adjust(self.browser.page, sel)
+                ):
+
+                    last_error = (
+                        "CART_SENSOR: цель достигнута (qty=1). "
+                        'Не жми «Увеличить»/счётчик — {"action":"done","message":"..."}.'
+                    )
+
+                    self._pending_vision_pngs = vision_batch + self._pending_vision_pngs
+
+                    continue
+
+                if (
+                    expects_cart
+                    and single_cart_item
+                    and cart_qty >= 1
+                    and click_targets_quantity_increase(self.browser.page, sel)
+                ):
+
+                    if cart_qty == 1:
+
+                        msg = "Один товар в корзине."
+
+                        log_using_tool("done", {"message": msg})
+
+                        log_task_finished(msg)
+
+                        return
+
+                    last_error = (
+                        f"Счётчик qty={cart_qty}: не «Увеличить», а один раз «Уменьшить» или done."
+                    )
+
+                    self._pending_vision_pngs = vision_batch + self._pending_vision_pngs
+
+                    continue
+
             log_using_tool(act, payload_for_log(action))
 
             try:
@@ -615,11 +851,32 @@ CURRENT PAGE:
 
                     scroll_streak = 0
 
+                if act == "type_text" and expects_cart and not search_enter_sent:
+
+                    query = (action.get("text") or "").strip()
+
+                    if len(query) >= 3:
+
+                        try:
+
+                            self.actions.press_page_key("Enter")
+
+                            search_enter_sent = True
+
+                            last_step_ok = (
+                                "Поиск: Enter отправлен — дождись выдачи, "
+                                'затем add_to_cart с product_name из CURRENT PAGE.'
+                            )
+
+                        except Exception:
+
+                            pass
+
                 if act == "add_to_cart":
 
                     cart = read_cart_state(self.browser.page)
 
-                    if cart_is_filled(cart):
+                    if _cart_goal_satisfied(cart, single_item=single_cart_item):
 
                         add_to_cart_calls += 1
 
@@ -627,7 +884,43 @@ CURRENT PAGE:
 
                         last_step_ok = (
                             "add_to_cart: CART_SENSOR items_present. "
-                            "Если USER TASK выполнен — done."
+                            'Следующий шаг: {"action":"done","message":"..."}.'
+                        )
+
+                elif act == "click_element":
+
+                    cart = read_cart_state(self.browser.page)
+
+                    if (
+                        expects_cart
+                        and single_cart_item
+                        and click_targets_quantity_decrease(
+                            self.browser.page, action.get("selector") or ""
+                        )
+                    ):
+
+                        stepper_decrease_clicks += 1
+
+                    if expects_cart and _cart_goal_satisfied(
+                        cart, single_item=single_cart_item
+                    ):
+
+                        last_step_ok = (
+                            "CART_SENSOR: items_present qty=1. "
+                            'Задача выполнена — {"action":"done","message":"..."}.'
+                        )
+
+                    elif (
+                        expects_cart
+                        and single_cart_item
+                        and cart_item_quantity(cart) == 1
+                        and click_targets_cart_nav(
+                            self.browser.page, action.get("selector") or ""
+                        )
+                    ):
+
+                        last_step_ok = (
+                            "CART_SENSOR: qty=1, можно открыть корзину или сразу done."
                         )
 
                 self.browser.adopt_new_tab_after_action()
@@ -718,6 +1011,20 @@ CURRENT PAGE:
                 raise RuntimeError(
                     "add_to_cart выполнен, но CART_SENSOR всё ещё empty."
                 )
+
+            if (
+                _task_expects_single_cart_item(getattr(self, "_user_task", ""))
+                and cart_item_quantity(cart) > 1
+            ):
+
+                raise RuntimeError(
+                    f"В корзине qty={cart_item_quantity(cart)} — больше одной позиции."
+                )
+
+            return (
+                "add_to_cart: CART_SENSOR items_present — следующий шаг done.",
+                f"{label}; CART_SENSOR: items_present qty={cart_item_quantity(cart)}",
+            )
 
         elif act == "dismiss_overlays":
 

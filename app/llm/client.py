@@ -55,7 +55,12 @@ def _geo_block_hint(model: str, raw: str) -> str | None:
 
     blob = raw.lower()
 
-    if "unsupported_country" not in blob and "region" not in blob:
+    if (
+        "unsupported_country" not in blob
+        and "region" not in blob
+        and "location is not supported" not in blob
+        and "failed_precondition" not in blob
+    ):
 
         return None
 
@@ -150,6 +155,48 @@ def _resolve_model(*, vision: bool) -> str:
     return os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-001").strip()
 
 
+def _fallback_models(primary: str) -> list[str]:
+
+    raw = os.getenv("OPENROUTER_FALLBACK_MODELS", "").strip()
+
+    if raw:
+
+        items = [m.strip() for m in raw.split(",") if m.strip()]
+
+    else:
+
+        items = [
+            "anthropic/claude-3.5-haiku",
+            "deepseek/deepseek-chat",
+            "meta-llama/llama-3.1-8b-instruct",
+        ]
+
+    out: list[str] = []
+
+    for m in [primary, *items]:
+
+        if m and m not in out:
+
+            out.append(m)
+
+    return out
+
+
+def _is_retryable_provider_error(exc: BaseException) -> bool:
+
+    blob = str(exc).lower()
+
+    markers = (
+        "location is not supported",
+        "failed_precondition",
+        "unsupported_country",
+        "region",
+        "provider returned error",
+    )
+
+    return any(m in blob for m in markers)
+
+
 def _png_to_b64(png: bytes) -> str:
 
     return base64.standard_b64encode(png).decode("ascii")
@@ -232,6 +279,12 @@ def _openrouter_chat(
 
     except BadRequestError as exc:
 
+        hint = _geo_block_hint(model, str(exc))
+
+        if hint:
+
+            raise RuntimeError(hint) from exc
+
         raise RuntimeError(f"OpenRouter: неверный запрос (400): {exc}") from exc
 
     except APIConnectionError as exc:
@@ -263,12 +316,34 @@ def ask_llm(system_prompt, user_prompt, *, vision_png_bytes: list[bytes] | None 
 
     png_b64_list = [_png_to_b64(p) for p in vision_png_bytes] if has_vision else None
 
-    return _openrouter_chat(
-        client,
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        png_b64_list=png_b64_list,
-    )
+    last_error: BaseException | None = None
+
+    for attempt_model in _fallback_models(model):
+
+        try:
+
+            return _openrouter_chat(
+                client,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model=attempt_model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                png_b64_list=png_b64_list,
+            )
+
+        except RuntimeError as exc:
+
+            last_error = exc
+
+            if _is_retryable_provider_error(exc) and attempt_model != _fallback_models(model)[-1]:
+
+                continue
+
+            raise
+
+    if last_error:
+
+        raise last_error
+
+    raise RuntimeError("OpenRouter: не удалось выполнить запрос.")
